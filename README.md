@@ -153,6 +153,25 @@ level, and the edit-bench-keep/revert loop adapted for the KernelBench `fast_p` 
 | `kernelbench/scorer.py` | Batch evaluation across a level, computes `fast_p` at thresholds (1.0x, 1.5x, 2.0x, 3.0x, 5.0x) |
 | `kernelbench/program_kb.md` | Agent instructions for KernelBench mode |
 
+## HuggingFace Kernels Export
+
+Export optimized kernels to the [HuggingFace Hub](https://huggingface.co/docs/kernels/en/index)
+for easy distribution. Users can then load your kernels with a single line:
+
+```python
+from kernels import get_kernel
+module = get_kernel("your-username/kernel-name")
+```
+
+```bash
+# Export an optimized CUDA kernel
+uv run export_hf.py --name my_matmul
+
+# Upload to Hub (requires `pip install kernels` and `huggingface-cli login`)
+cd workspace/hf_export/my_matmul
+kernels upload . --repo_id your-username/my_matmul
+```
+
 ## Project Structure
 
 ```
@@ -168,6 +187,7 @@ autokernel/
   extract.py            extract bottleneck kernels into workspace/
   orchestrate.py        multi-kernel scheduler (Amdahl's law)
   verify.py             end-to-end model verification + speedup report
+  export_hf.py          export optimized kernels to HuggingFace Kernels format
   analysis.py           experiment visualization (generates progress.png)
 
   kernels/              starter Triton kernels (9 types)

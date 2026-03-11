@@ -17,7 +17,9 @@ import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
+import pickle
 import re
 import sys
 import traceback
@@ -510,8 +512,20 @@ def profile_model(
     inputs: Dict[str, Any],
     warmup_iters: int = WARMUP_ITERS,
     profile_iters: int = PROFILE_ITERS,
-) -> List[KernelRecord]:
-    """Profile the model and return a list of KernelRecords sorted by GPU time desc."""
+    export_trace: bool = False,
+    memory_snapshot: bool = False,
+) -> Tuple[List[KernelRecord], Dict[str, Any]]:
+    """Profile the model and return a list of KernelRecords sorted by GPU time desc.
+
+    Returns:
+        Tuple of (records, extras) where extras contains paths to exported
+        artifacts and optional HTA analysis results.
+    """
+    extras: Dict[str, Any] = {}
+
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    trace_path = os.path.join(WORKSPACE_DIR, "trace.json")
+    snapshot_path = os.path.join(WORKSPACE_DIR, "memory_snapshot.pickle")
 
     # --- Warmup ---
     with torch.no_grad():
@@ -519,6 +533,14 @@ def profile_model(
             _run_forward(model, inputs)
 
     torch.cuda.synchronize()
+
+    # --- Start memory recording if requested ---
+    if memory_snapshot:
+        try:
+            torch.cuda.memory._record_memory_history(max_entries=100000)
+        except Exception as e:
+            print(f"  WARNING: Could not start memory history recording: {e}")
+            memory_snapshot = False
 
     # --- Profile ---
     with torch.no_grad():
@@ -533,6 +555,44 @@ def profile_model(
             for _ in range(profile_iters):
                 _run_forward(model, inputs)
                 torch.cuda.synchronize()
+
+    # --- Export Chrome trace ---
+    if export_trace:
+        try:
+            prof.export_chrome_trace(trace_path)
+            extras["trace_path"] = trace_path
+        except Exception as e:
+            print(f"  WARNING: Could not export Chrome trace: {e}")
+
+    # --- Capture memory snapshot ---
+    if memory_snapshot:
+        try:
+            snapshot = torch.cuda.memory._snapshot()
+            with open(snapshot_path, "wb") as snap_f:
+                pickle.dump(snapshot, snap_f)
+            extras["memory_snapshot_path"] = snapshot_path
+        except Exception as e:
+            print(f"  WARNING: Could not capture memory snapshot: {e}")
+        finally:
+            try:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            except Exception:
+                pass
+
+    # --- Optional HTA analysis ---
+    if export_trace and "trace_path" in extras:
+        try:
+            from HolisticTraceAnalysis import TraceAnalysis  # type: ignore[import-untyped]
+            trace_dir = os.path.dirname(extras["trace_path"])
+            analyzer = TraceAnalysis(trace_dir=trace_dir)
+            temporal = analyzer.get_temporal_breakdown()
+            kernel_breakdown = analyzer.get_gpu_kernel_breakdown()
+            extras["hta_temporal_breakdown"] = str(temporal)
+            extras["hta_kernel_breakdown"] = str(kernel_breakdown)
+        except ImportError:
+            pass  # HTA not installed, skip
+        except Exception as e:
+            print(f"  WARNING: HTA analysis failed: {e}")
 
     # --- Extract kernel averages ---
     key_averages = prof.key_averages(group_by_input_shape=True)
@@ -566,7 +626,7 @@ def profile_model(
     # Sort by GPU time descending
     records.sort(key=lambda r: r.gpu_time_us, reverse=True)
 
-    return records
+    return records, extras
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +885,26 @@ def parse_args() -> argparse.Namespace:
         help="Output JSON path (default: workspace/profile_report.json).",
     )
 
+    # Advanced profiling exports
+    parser.add_argument(
+        "--export-trace",
+        action="store_true",
+        default=False,
+        help="Export Chrome trace JSON for HTA/trace-blame analysis (saved to workspace/trace.json).",
+    )
+    parser.add_argument(
+        "--memory-snapshot",
+        action="store_true",
+        default=False,
+        help="Capture CUDA memory snapshot for mosaic analysis (saved to workspace/memory_snapshot.pickle).",
+    )
+    parser.add_argument(
+        "--torch-compile-log",
+        action="store_true",
+        default=False,
+        help="Save torch.compile logs for tlparse analysis (saved to workspace/compile_log.txt).",
+    )
+
     args = parser.parse_args()
 
     if not args.model and not args.module:
@@ -904,13 +984,35 @@ def main() -> int:
         print("ERROR: GPU out of memory. Try a smaller --input-shape or batch size.")
         return 1
 
+    # Enable torch.compile logging if requested
+    compile_log_path = os.path.join(WORKSPACE_DIR, "compile_log.txt")
+    compile_log_handler: Optional[logging.FileHandler] = None
+    if args.torch_compile_log:
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        try:
+            torch._logging.set_logs(dynamo=logging.DEBUG, inductor=logging.DEBUG)  # type: ignore[attr-defined]
+            compile_log_handler = logging.FileHandler(compile_log_path, mode="w")
+            compile_log_handler.setLevel(logging.DEBUG)
+            for logger_name in ["torch._dynamo", "torch._inductor"]:
+                lg = logging.getLogger(logger_name)
+                lg.addHandler(compile_log_handler)
+                lg.setLevel(logging.DEBUG)
+            print("  torch.compile logging enabled.")
+        except Exception as e:
+            print(f"  WARNING: Could not enable torch.compile logging: {e}")
+            compile_log_handler = None
+
     # Profile
     print(
         f"Profiling... ({WARMUP_ITERS} warmup + "
         f"{PROFILE_ITERS} measured iterations)"
     )
     try:
-        records = profile_model(model, inputs, WARMUP_ITERS, PROFILE_ITERS)
+        records, extras = profile_model(
+            model, inputs, WARMUP_ITERS, PROFILE_ITERS,
+            export_trace=args.export_trace,
+            memory_snapshot=args.memory_snapshot,
+        )
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         print(
@@ -931,8 +1033,25 @@ def main() -> int:
         print("Check that the model runs on GPU and the input shape is correct.")
         return 1
 
+    # Finalize torch.compile log
+    if compile_log_handler is not None:
+        for logger_name in ["torch._dynamo", "torch._inductor"]:
+            lg = logging.getLogger(logger_name)
+            lg.removeHandler(compile_log_handler)
+        compile_log_handler.close()
+        if os.path.isfile(compile_log_path) and os.path.getsize(compile_log_path) > 0:
+            extras["compile_log_path"] = compile_log_path
+        else:
+            print("  NOTE: torch.compile log is empty (no torch.compile calls detected).")
+
     # Build report
     report = build_report(records, gpu, args, model_desc)
+
+    # Add HTA results to report if available
+    if "hta_temporal_breakdown" in extras:
+        report["hta_temporal_breakdown"] = extras["hta_temporal_breakdown"]
+    if "hta_kernel_breakdown" in extras:
+        report["hta_kernel_breakdown"] = extras["hta_kernel_breakdown"]
 
     # Print to terminal
     print_report(records, report, model_desc)
@@ -951,6 +1070,33 @@ def main() -> int:
         json.dump(report, f, indent=2)
 
     print(f"Profile saved to {output_path}")
+
+    # Print exported artifacts and next-step suggestions
+    if extras:
+        print()
+        print("=" * 60)
+        print("  EXPORTED ARTIFACTS")
+        print("=" * 60)
+        if "trace_path" in extras:
+            print(f"  Chrome trace:     {extras['trace_path']}")
+        if "memory_snapshot_path" in extras:
+            print(f"  Memory snapshot:  {extras['memory_snapshot_path']}")
+        if "compile_log_path" in extras:
+            print(f"  Compile log:      {extras['compile_log_path']}")
+        if "hta_temporal_breakdown" in extras:
+            print("  HTA analysis:     included in profile_report.json")
+
+        print()
+        print("  Suggested next steps:")
+        if "trace_path" in extras:
+            print(f"    - View trace in Chrome:  chrome://tracing  (load {extras['trace_path']})")
+            print("    - Run HTA analysis:      pip install HolisticTraceAnalysis && analyze trace")
+            print("    - Run trace-blame:       trace-blame " + extras["trace_path"])
+        if "memory_snapshot_path" in extras:
+            print(f"    - Analyze with mosaic:   python -m torch.cuda.memory._snapshot {extras['memory_snapshot_path']}")
+        if "compile_log_path" in extras:
+            print(f"    - Parse with tlparse:    tlparse {extras['compile_log_path']}")
+
     print()
 
     return 0

@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.2.0 -- 2026-03-12
+
+### Enhanced Profiler (Issue #1)
+
+- Added `--export-trace` flag to export Chrome trace JSON for HTA/trace-blame analysis
+- Added `--memory-snapshot` flag to capture CUDA memory snapshots for mosaic analysis
+- Added `--torch-compile-log` flag to save torch.compile logs for tlparse analysis
+- Added optional HTA (Holistic Trace Analysis) integration -- when installed, runs temporal and kernel breakdown analysis
+- Added exported artifacts summary with suggested next steps for each tool
+- Added `HolisticTraceAnalysis` as optional `profiling` dependency
+
+### HuggingFace Kernels Export (Issue #2)
+
+- Added `export_hf.py` -- exports optimized kernels to HuggingFace Kernels format
+- Supports CUDA C++ kernels: auto-extracts CUDA source, parses function signatures, generates `build.toml` + `torch_binding.cpp` + `__init__.py`
+- Supports Triton kernels: packages as a Python module with pyproject.toml
+- Generates ready-to-upload project structure compatible with `kernels upload` CLI
+- Added `kernels` and `huggingface-hub` as optional `hf-kernels` dependencies
+
 ## v1.1.0 -- 2026-03-12
 
 ### Native CUDA C++ Backend
