@@ -29,8 +29,10 @@ import argparse
 import copy
 import importlib.util
 import json
+import os
 import signal
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -556,11 +558,85 @@ def _try_enable_hipblaslt_tuning(
 
     The tuning result is persisted to ``hipblaslt_tuning.csv`` so subsequent
     runs skip the search.
+
+    NOTE: hipBLASLt tuning can crash (SIGABRT) on certain shape/dtype
+    combinations due to ROCm bugs.  The tuning is run in a subprocess to
+    isolate crashes.  If the subprocess crashes, tuning is skipped and the
+    default heuristic is used.
     """
     try:
         import torch
         import torch.cuda.tunable as tunable
     except (ImportError, AttributeError):
+        return False
+
+    tuning_path = PROJECT_DIR / TUNING_FILE_NAME
+    already_tuned = tuning_path.exists()
+
+    # Always enable + load if file exists
+    if already_tuned:
+        tunable.enable(True)
+        tunable.set_filename(str(tuning_path))
+        tunable.read_file(str(tuning_path))
+        print(f"  Loaded hipBLASLt tuning from {tuning_path.name}")
+        return True
+
+    # Run tuning in a subprocess to isolate potential crashes (SIGABRT from
+    # hipBLASLt trying invalid algorithms on certain shapes).
+    print("  Running hipBLASLt auto-tuning in subprocess (one-time)...")
+
+    tuning_script = f'''
+import torch, torch.cuda.tunable as tunable, importlib.util, sys
+tunable.enable(True)
+tunable.tuning_enable(True)
+tunable.set_max_tuning_iterations(30)
+tunable.set_max_tuning_duration(15)
+tunable.set_filename("{tuning_path}")
+
+spec = importlib.util.spec_from_file_location("_ref", "{KB_ACTIVE_DIR / "reference.py"}")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+Model = mod.Model
+get_inputs = mod.get_inputs
+get_init_inputs = getattr(mod, "get_init_inputs", lambda: [])
+
+model = Model(*get_init_inputs()).to("cuda").eval()
+inputs = [t.to("cuda") if isinstance(t, torch.Tensor) else t for t in get_inputs()]
+for i in range({TUNING_N_WARMUP}):
+    with torch.no_grad():
+        model(*inputs)
+    torch.cuda.synchronize()
+tunable.write_file("{tuning_path}")
+print("TUNING_OK")
+'''
+    try:
+        env = dict(os.environ)
+        result = subprocess.run(
+            [sys.executable, "-c", tuning_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        if result.returncode == 0 and "TUNING_OK" in result.stdout:
+            # Load the tuning results in this process
+            tunable.enable(True)
+            tunable.set_filename(str(tuning_path))
+            tunable.read_file(str(tuning_path))
+            print(f"  hipBLASLt tuning saved to {tuning_path.name}")
+            return True
+        else:
+            stderr_tail = (result.stderr or "")[-200:]
+            print(f"  hipBLASLt tuning subprocess failed (rc={result.returncode})")
+            if stderr_tail:
+                print(f"    {stderr_tail}")
+            print("  Continuing without tuning (using default heuristic).")
+            return False
+    except subprocess.TimeoutExpired:
+        print("  hipBLASLt tuning subprocess timed out. Continuing without tuning.")
+        return False
+    except Exception as e:
+        print(f"  hipBLASLt tuning failed (non-fatal): {e}")
         return False
 
     tuning_path = PROJECT_DIR / TUNING_FILE_NAME

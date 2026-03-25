@@ -524,7 +524,65 @@ def get_problem(level: int, problem_id: int) -> Optional[KernelBenchProblem]:
 # ---------------------------------------------------------------------------
 
 
-def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
+_DTYPE_CAST_SNIPPET = '''
+# ---------------------------------------------------------------------------
+# Dtype override: cast all inputs and model parameters to {dtype}
+# This ensures benchmarking uses production-realistic precision instead of
+# fp32, which modern inference never uses.
+# ---------------------------------------------------------------------------
+import torch as _torch
+
+_OVERRIDE_DTYPE = _torch.{torch_dtype}
+
+_original_get_inputs = get_inputs
+
+def get_inputs():
+    """Wrapped get_inputs: cast float32 tensors to {dtype}."""
+    inputs = _original_get_inputs()
+    out = []
+    for t in inputs:
+        if isinstance(t, _torch.Tensor) and t.is_floating_point() and t.dtype == _torch.float32:
+            out.append(t.to(_OVERRIDE_DTYPE))
+        else:
+            out.append(t)
+    return out
+
+_original_Model_init = Model.__init__
+
+def _patched_model_init(self, *args, **kwargs):
+    _original_Model_init(self, *args, **kwargs)
+    # Cast all float parameters/buffers to target dtype
+    self.to(_OVERRIDE_DTYPE)
+
+Model.__init__ = _patched_model_init
+'''
+
+_DTYPE_CAST_SNIPPET_NEW = """
+_original_ModelNew_init = ModelNew.__init__
+
+def _patched_modelnew_init(self, *args, **kwargs):
+    _original_ModelNew_init(self, *args, **kwargs)
+    self.to(_OVERRIDE_DTYPE)
+
+ModelNew.__init__ = _patched_modelnew_init
+"""
+
+# Map CLI dtype names to torch dtype names
+_DTYPE_MAP = {
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+    "fp16": "float16",
+    "float16": "float16",
+    "fp32": "float32",
+    "float32": "float32",
+}
+
+
+def setup_problem(
+    problem: KernelBenchProblem,
+    backend: str = "cuda",
+    dtype: Optional[str] = None,
+) -> None:
     """
     Set up workspace for optimizing a KernelBench problem.
 
@@ -532,12 +590,44 @@ def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
       workspace/kb_active/reference.py   -- original Model + get_inputs
       workspace/kb_active/metadata.json  -- problem metadata + analysis
       kernel.py                          -- starter ModelNew (edit this)
+
+    Args:
+        dtype: Override precision for inputs and model parameters.
+               One of: bf16, fp16, fp32, or None (keep original).
+               When set, wraps get_inputs() to cast fp32 tensors and
+               patches Model/ModelNew.__init__ to call .to(dtype).
     """
     KB_ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Resolve dtype
+    torch_dtype = None
+    if dtype is not None:
+        torch_dtype = _DTYPE_MAP.get(dtype.lower())
+        if torch_dtype is None:
+            print(
+                f"ERROR: Unknown dtype '{dtype}'. Use one of: {', '.join(_DTYPE_MAP.keys())}"
+            )
+            sys.exit(1)
+
+    # Build dtype cast snippet for reference.py and kernel.py
+    ref_dtype_snippet = ""
+    kern_dtype_snippet = ""
+    if torch_dtype and torch_dtype != "float32":
+        ref_dtype_snippet = _DTYPE_CAST_SNIPPET.format(
+            dtype=dtype,
+            torch_dtype=torch_dtype,
+        )
+        kern_dtype_snippet = (
+            _DTYPE_CAST_SNIPPET.format(dtype=dtype, torch_dtype=torch_dtype)
+            + _DTYPE_CAST_SNIPPET_NEW
+        )
+
     # Write reference
     ref_path = KB_ACTIVE_DIR / "reference.py"
-    ref_path.write_text(problem.source_code, encoding="utf-8")
+    ref_source = problem.source_code
+    if ref_dtype_snippet:
+        ref_source += "\n" + ref_dtype_snippet
+    ref_path.write_text(ref_source, encoding="utf-8")
 
     # Write metadata
     meta_path = KB_ACTIVE_DIR / "metadata.json"
@@ -550,10 +640,14 @@ def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
         "analysis": analysis,
         "backend": backend,
     }
+    if torch_dtype:
+        metadata["dtype_override"] = torch_dtype
     meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     # Generate starter kernel.py
     starter = problem.generate_starter(backend=backend)
+    if kern_dtype_snippet:
+        starter += "\n" + kern_dtype_snippet
     KERNEL_PY.write_text(starter, encoding="utf-8")
 
     # Report
@@ -565,6 +659,8 @@ def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
     print(f"  Difficulty: {analysis['estimated_difficulty']}")
     print(f"  Parameters: {'yes' if analysis['has_parameters'] else 'no'}")
     print(f"  Forward:    {analysis['forward_lines']} lines")
+    if torch_dtype and torch_dtype != "float32":
+        print(f"  Dtype:      {dtype} (overriding fp32 inputs/weights)")
     if analysis["input_shapes"]:
         for i, s in enumerate(analysis["input_shapes"]):
             print(f"  Input {i}:    shape={s}")
@@ -620,6 +716,14 @@ def main() -> None:
     )
     setup_p.add_argument("--repo-path", type=str, default=None)
     setup_p.add_argument("--file-path", type=str, default=None)
+    setup_p.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        help="Override precision: bf16, fp16, or fp32. Casts inputs and model "
+        "parameters to this dtype. Use bf16/fp16 for realistic inference "
+        "baselines instead of fp32 (default: keep original).",
+    )
 
     args = parser.parse_args()
 
@@ -707,7 +811,7 @@ def main() -> None:
             )
             print("  Or add --source hf to auto-fetch.")
             sys.exit(1)
-        setup_problem(prob, backend=args.backend)
+        setup_problem(prob, backend=args.backend, dtype=getattr(args, "dtype", None))
 
     else:
         parser.print_help()
