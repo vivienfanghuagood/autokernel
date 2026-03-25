@@ -1,204 +1,171 @@
 """
-AutoKernel -- Extracted kernel from model profiling.
-Op type: flash_attention
-Rank: 1 (23.9% of GPU time)
-Model shape: batch=2, heads=32, seq_len=1024, head_dim=64
+KernelBench Problem L1_P002: 2_Standard_matrix_multiplication_
+Level: 1 | Problem ID: 2
+Operations: matmul
+Difficulty: medium
 
-This kernel was extracted from profiling models/llama_7b.py.
-The agent optimizes this to maximize throughput at the model-specific shapes.
+Source: ScalingIntelligence/KernelBench
+Optimized with AutoKernel (https://github.com/RightNow-AI/autokernel)
+
+The agent optimizes ModelNew to outperform the PyTorch reference (Model).
+Edit ModelNew.forward() -- use CUDA C++ via compile_cuda() or Triton @jit.
+Run `uv run kernelbench/bench_kb.py` to evaluate correctness + speedup.
 """
 
-KERNEL_TYPE = "flash_attention"
-
-# Model-specific shapes (the shapes that matter for THIS model)
-MODEL_SHAPES = {'batch': 2, 'heads': 32, 'seq_len': 1024, 'head_dim': 64}
-
-# Benchmark config (self-describing -- bench.py can load this dynamically)
-TEST_SIZES = [
-    ("model_primary", {'batch': 2, 'heads': 32, 'seq_len': 1024, 'head_dim': 64}),
-    # Also test nearby sizes for robustness
-    ("model_half", {'batch': 1, 'heads': 16, 'seq_len': 512, 'head_dim': 32}),
-    ("model_double", {'batch': 4, 'heads': 64, 'seq_len': 2048, 'head_dim': 128}),
-]
-
-TOLERANCES = {'float16': {'atol': 0.01, 'rtol': 0.01}, 'bfloat16': {'atol': 0.02, 'rtol': 0.02}, 'float32': {'atol': 0.0001, 'rtol': 0.0001}}
-
-
-def FLOPS_FN(s):
-    return 4 * s["batch"] * s["heads"] * (s["seq_len"] ** 2) * s["head_dim"]
-
-
-def BYTES_FN(s, dt_bytes):
-    return 4 * s["batch"] * s["heads"] * s["seq_len"] * s["head_dim"] * dt_bytes
-
-
-# ======================================================================
-# Triton kernel code (from kernels/flash_attention.py)
-# ======================================================================
+KERNELBENCH_PROBLEM = {
+    "level": 1,
+    "problem_id": 2,
+    "name": '2_Standard_matrix_multiplication_',
+}
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# Optional: use AutoKernel's CUDA compilation utility for custom CUDA C++ kernels
+# from kernels.cuda._compile import compile_cuda
+#
+# CUDA_SRC = r"""
+# #include <torch/extension.h>
+# #include <cuda_runtime.h>
+# #include <cuda_fp16.h>
+#
+# __global__ void my_kernel(const float* input, float* output, int N) {
+#     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+#     if (idx < N) output[idx] = input[idx];
+# }
+#
+# torch::Tensor my_op_cuda(torch::Tensor input) {
+#     auto output = torch::empty_like(input);
+#     int N = input.numel();
+#     my_kernel<<<(N+255)/256, 256>>>(input.data_ptr<float>(), output.data_ptr<float>(), N);
+#     return output;
+# }
+# """
+# _mod = None
+# def _get_mod():
+#     global _mod
+#     if _mod is None:
+#         _mod = compile_cuda(CUDA_SRC, "my_op_cuda")
+#     return _mod
+
+# ============================================================================
+# Reference implementation (DO NOT MODIFY below this line)
+# ============================================================================
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return torch.matmul(A, B)
+
+M = 1024 * 2
+K = 4096 * 2
+N = 2048 * 2
+
+def get_inputs():
+    A = torch.rand(M, K)
+    B = torch.rand(K, N)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+
+# ============================================================================
+# Optimized implementation (EDIT THIS)
+# ============================================================================
+
+# ModelNew must produce outputs matching Model within atol=1e-2, rtol=1e-2.
+# Start by copying Model's logic, then optimize with CUDA C++ or Triton.
+
 import triton
 import triton.language as tl
-import math
 
 
 @triton.jit
-def flash_attention_kernel(
-    Q_ptr, K_ptr, V_ptr, O_ptr,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, M_size, N_size,
-    D: tl.constexpr,
-    sm_scale,
-    IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def matmul_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M_size, N_size, K_size,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
-    """Flash attention with online softmax. One program per (batch, head, query-block)."""
-    pid_z = tl.program_id(2)  # batch
-    pid_h = tl.program_id(1)  # head
-    pid_m = tl.program_id(0)  # query block
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M_size, BLOCK_M)
+    num_pid_n = tl.cdiv(N_size, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Offsets into the batch and head
-    qkv_offset_z = pid_z * stride_qz
-    qkv_offset_h = pid_h * stride_qh
-
-    k_offset_z = pid_z * stride_kz
-    k_offset_h = pid_h * stride_kh
-
-    v_offset_z = pid_z * stride_vz
-    v_offset_h = pid_h * stride_vh
-
-    o_offset_z = pid_z * stride_oz
-    o_offset_h = pid_h * stride_oh
-
-    # Query block offsets
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, D)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Load Q block [BLOCK_M, D]
-    q_ptrs = Q_ptr + qkv_offset_z + qkv_offset_h + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
-    q_mask = offs_m[:, None] < M_size
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-    # Initialize running max and sum for online softmax
-    m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K_size, BLOCK_K)):
+        k_mask_a = (offs_k[None, :] + k * BLOCK_K) < K_size
+        k_mask_b = (offs_k[:, None] + k * BLOCK_K) < K_size
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M_size) & k_mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask_b & (offs_n[None, :] < N_size), other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
 
-    # Determine the range of KV blocks to iterate over
-    if IS_CAUSAL:
-        kv_end = tl.minimum(N_size, (pid_m + 1) * BLOCK_M)
-    else:
-        kv_end = N_size
-
-    # Iterate over KV blocks
-    for start_n in range(0, kv_end, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-
-        # Load K block [BLOCK_N, D]
-        k_ptrs = K_ptr + k_offset_z + k_offset_h + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kk
-        k_mask = offs_n[:, None] < N_size
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
-
-        # Compute QK^T [BLOCK_M, BLOCK_N]
-        qk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        qk += tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)))
-        qk *= sm_scale
-
-        # Apply causal mask
-        if IS_CAUSAL:
-            causal_mask = offs_m[:, None] >= offs_n[None, :]
-            qk = tl.where(causal_mask, qk, float("-inf"))
-
-        # Mask out-of-bounds keys
-        kv_mask = offs_n[None, :] < N_size
-        qk = tl.where(kv_mask, qk, float("-inf"))
-
-        # Online softmax update
-        m_ij = tl.max(qk, axis=1)  # [BLOCK_M]
-        m_new = tl.maximum(m_i, m_ij)
-
-        # Correction factor for previous accumulator
-        # Clamp to avoid exp overflow with adversarial inputs
-        alpha = tl.exp(tl.maximum(m_i - m_new, -30.0))
-        # New attention weights
-        p = tl.exp(tl.maximum(qk - m_new[:, None], -30.0))
-
-        # Update running sum
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-
-        # Update accumulator: rescale old and add new
-        acc = acc * alpha[:, None]
-
-        # Load V block [BLOCK_N, D]
-        v_ptrs = V_ptr + v_offset_z + v_offset_h + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vk
-        v_mask = offs_n[:, None] < N_size
-        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-
-        acc += tl.dot(p.to(v.dtype), v).to(tl.float32)
-
-        m_i = m_new
-
-    # Final normalization
-    acc = acc / l_i[:, None]
-
-    # Store output
-    o_ptrs = O_ptr + o_offset_z + o_offset_h + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
-    o_mask = offs_m[:, None] < M_size
-    tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=o_mask)
+    c = acc.to(C_ptr.dtype.element_ty)
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M_size) & (offs_n[None, :] < N_size)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
-def kernel_fn(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    causal: bool = True,
-    sm_scale: float = None,
-) -> torch.Tensor:
+class ModelNew(nn.Module):
     """
-    Entry point called by bench.py. Must match reference.flash_attention_ref signature.
-
-    Args:
-        Q: [batch, heads, seq_len, head_dim]
-        K: [batch, heads, seq_len, head_dim]
-        V: [batch, heads, seq_len, head_dim]
-        causal: whether to apply causal masking
-        sm_scale: softmax scale factor, default 1/sqrt(head_dim)
+    Triton tiled matmul optimized for RDNA4 (gfx1201).
     """
-    assert Q.is_cuda and K.is_cuda and V.is_cuda
+    def __init__(self):
+        super(ModelNew, self).__init__()
 
-    Z, H, M_size, D = Q.shape
-    _, _, N_size, _ = K.shape
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        M_size, K_size = A.shape
+        K_size2, N_size = B.shape
+        C = torch.empty((M_size, N_size), device=A.device, dtype=A.dtype)
+        # RDNA4: wave32, limited shared memory
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        grid = (triton.cdiv(M_size, BLOCK_M) * triton.cdiv(N_size, BLOCK_N),)
+        matmul_kernel[grid](
+            A, B, C,
+            M_size, N_size, K_size,
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            C.stride(0), C.stride(1),
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            GROUP_M=8,
+            num_warps=4, num_stages=1,
+        )
+        return C
 
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(D)
-
-    O = torch.empty_like(Q)
-
-    # Block sizes -- must be powers of 2
-    # D (head_dim) must be a constexpr and power of 2 for tl.trans to work
-    assert D in (16, 32, 64, 128, 256), f"Head dim {D} not supported, must be power of 2 in [16..256]"
-
-    BLOCK_M = 64
-    BLOCK_N = 64
-
-    grid = (triton.cdiv(M_size, BLOCK_M), H, Z)
-
-    flash_attention_kernel[grid](
-        Q, K, V, O,
-        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
-        Z, H, M_size, N_size,
-        D=D,
-        sm_scale=sm_scale,
-        IS_CAUSAL=causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-
-    return O
+M = 1024 * 2
+K = 4096 * 2
+N = 2048 * 2
