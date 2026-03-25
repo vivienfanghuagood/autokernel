@@ -539,7 +539,7 @@ def _robust_median(times: List[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-TUNING_N_WARMUP = 200
+TUNING_N_WARMUP = 20
 TUNING_FILE_NAME = "hipblaslt_tuning.csv"
 
 
@@ -559,15 +559,102 @@ def _try_enable_hipblaslt_tuning(
     The tuning result is persisted to ``hipblaslt_tuning.csv`` so subsequent
     runs skip the search.
 
-    NOTE: hipBLASLt tuning can crash (SIGABRT) on certain shape/dtype
-    combinations due to ROCm bugs.  The tuning is run in a subprocess to
-    isolate crashes.  If the subprocess crashes, tuning is skipped and the
-    default heuristic is used.
+    NOTE: max_tuning_iterations is kept low (5) because higher values can
+    trigger memory access faults in hipBLASLt on certain shape/dtype combos
+    (ROCm bug where later candidate algorithms access out-of-bounds memory).
+    5 iterations is sufficient to find a near-optimal algorithm.
     """
     try:
         import torch
         import torch.cuda.tunable as tunable
     except (ImportError, AttributeError):
+        return False
+
+    tuning_path = PROJECT_DIR / TUNING_FILE_NAME
+    already_tuned = tuning_path.exists()
+
+    # Load cached tuning if file exists and is non-empty
+    if already_tuned and tuning_path.stat().st_size > 0:
+        tunable.enable(True)
+        tunable.set_filename(str(tuning_path))
+        tunable.read_file(str(tuning_path))
+        print(f"  Loaded hipBLASLt tuning from {tuning_path.name}")
+        return True
+    elif already_tuned:
+        # Empty/corrupt file from a previous crashed tuning — remove it
+        tuning_path.unlink(missing_ok=True)
+
+    # Check for a marker file indicating that tuning has previously crashed
+    # on this GPU.  If so, skip entirely to avoid GPU state corruption
+    # (a crashed tuning subprocess can degrade performance on the same GPU
+    # even for the parent process).
+    tuning_skip_marker = PROJECT_DIR / ".hipblaslt_tuning_skip"
+    if tuning_skip_marker.exists():
+        print("  hipBLASLt tuning skipped (previously crashed on this GPU).")
+        print("  Delete .hipblaslt_tuning_skip to retry.")
+        return False
+
+    # Run tuning in a subprocess.  hipBLASLt tuning can SIGABRT on certain
+    # shape/dtype combos (ROCm bug: some candidate algorithms access
+    # out-of-bounds GPU memory).  Subprocess isolation keeps the main
+    # benchmark process alive.  When it crashes, we create a skip marker
+    # so we never try again on this GPU.
+    print("  Running hipBLASLt auto-tuning in subprocess (one-time)...")
+
+    ref_path = str(KB_ACTIVE_DIR / "reference.py")
+    tuning_script = (
+        "import torch, torch.cuda.tunable as tunable, importlib.util\n"
+        "tunable.enable(True)\n"
+        "tunable.tuning_enable(True)\n"
+        "tunable.set_max_tuning_iterations(5)\n"
+        "tunable.set_max_tuning_duration(10)\n"
+        f'tunable.set_filename("{tuning_path}")\n'
+        f'spec = importlib.util.spec_from_file_location("_ref", "{ref_path}")\n'
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "model = mod.Model(*getattr(mod, 'get_init_inputs', lambda:[])()).to('cuda').eval()\n"
+        "inputs = [t.to('cuda') if isinstance(t, __import__('torch').Tensor) else t for t in mod.get_inputs()]\n"
+        f"for _ in range({TUNING_N_WARMUP}):\n"
+        "    with __import__('torch').no_grad(): model(*inputs)\n"
+        "    __import__('torch').cuda.synchronize()\n"
+        "tunable.tuning_enable(False)\n"
+        f'tunable.write_file("{tuning_path}")\n'
+        'print("TUNING_OK")\n'
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", tuning_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=dict(os.environ),
+        )
+        if result.returncode == 0 and "TUNING_OK" in result.stdout:
+            tunable.enable(True)
+            tunable.set_filename(str(tuning_path))
+            tunable.read_file(str(tuning_path))
+            print(f"  hipBLASLt tuning saved to {tuning_path.name}")
+            return True
+        else:
+            stderr_tail = (result.stderr or "").strip().split("\n")[-1][:120]
+            # Clean up empty/corrupt tuning file left by crashed subprocess
+            if tuning_path.exists():
+                tuning_path.unlink(missing_ok=True)
+            # Write skip marker so we never try again on this GPU
+            tuning_skip_marker.write_text(
+                f"hipBLASLt tuning crashed (rc={result.returncode})\n"
+                f"{stderr_tail}\n"
+                "Delete this file to retry tuning.\n"
+            )
+            print(f"  hipBLASLt tuning crashed (rc={result.returncode}): {stderr_tail}")
+            print("  Created .hipblaslt_tuning_skip marker to prevent future attempts.")
+            print("  Using default heuristic. Delete .hipblaslt_tuning_skip to retry.")
+            return False
+    except subprocess.TimeoutExpired:
+        print("  hipBLASLt tuning timed out. Using default heuristic.")
+        return False
+    except Exception as e:
+        print(f"  hipBLASLt tuning failed: {e}")
         return False
 
     tuning_path = PROJECT_DIR / TUNING_FILE_NAME
