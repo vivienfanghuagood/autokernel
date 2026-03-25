@@ -151,8 +151,8 @@ class ModelNew(nn.Module):
         M_size, K_size = A.shape
         K_size2, N_size = B.shape
         C = torch.empty((M_size, N_size), device=A.device, dtype=A.dtype)
-        # RDNA4: wave32, limited shared memory
-        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        # RDNA4: wave32, larger tiles to increase arithmetic intensity
+        BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
         grid = (triton.cdiv(M_size, BLOCK_M) * triton.cdiv(N_size, BLOCK_N),)
         matmul_kernel[grid](
             A, B, C,
