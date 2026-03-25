@@ -190,6 +190,112 @@ Go back to 2.2. Each iteration should be one focused change.
 
 ---
 
+## Benchmarking Methodology
+
+### hipBLASLt Auto-Tuning
+
+`bench_kb.py` **automatically tunes hipBLASLt** on the first run for any problem
+that uses BLAS operations (matmul, `_scaled_mm`, linear, conv, etc.).  This
+ensures the reference baseline uses the fastest available hipBLASLt algorithm
+for the exact problem shape -- not the default heuristic.
+
+**Why this matters**: hipBLASLt's default heuristic can be 1.5-2x slower than
+the tuned algorithm.  Without tuning, a custom Triton kernel would appear to
+"win" by comparing against an unfairly slow baseline.
+
+Tuning results are cached to `hipblaslt_tuning.csv` so subsequent runs reuse
+them instantly.  Delete the file to re-tune.
+
+### Pure GPU Kernel Latency (Stage 5)
+
+After the standard speedup measurement (Stage 4), `bench_kb.py` runs
+**Stage 5: Pure GPU Kernel Latency** which measures each kernel call
+individually with CUDA events:
+
+```
+start.record()
+model(*inputs)      # single call, no tensor alloc, no Python logic
+end.record()
+synchronize()
+```
+
+It reports **min / p50 / p90 / p99 / mean / std** in microseconds for both
+the reference and the kernel.  The **p50 (median) speedup** is the primary
+metric for pure GPU performance -- it eliminates Python dispatch overhead
+and tensor allocation noise that can pollute Stage 4 results.
+
+**Key greppable fields** in the summary:
+```
+gpu_latency_ref_p50_us: 34.0
+gpu_latency_kern_p50_us: 26.5
+gpu_latency_speedup: 1.283x
+```
+
+### Interpreting Results
+
+| Metric | What it measures | Use for |
+|--------|-----------------|---------|
+| `speedup` (Stage 4) | End-to-end including Python dispatch | Overall practical speedup |
+| `gpu_latency_speedup` (Stage 5) | Pure GPU kernel execution | True kernel performance |
+| `kernel_time_ms` | Trimmed median of batched timing | Quick iteration comparison |
+
+If Stage 4 speedup and Stage 5 speedup disagree significantly, the difference
+is Python overhead (tensor allocation, view creation, dispatch).  Optimize the
+GPU kernel first (Stage 5), then reduce Python overhead if needed.
+
+---
+
+## AMD ROCm Optimization Checklist
+
+Before writing a kernel, verify these common pitfalls on AMD GPUs:
+
+### Memory Layout
+
+- **CRITICAL: tl.dot direction matters.** `tl.dot(A, B)` expects A=(M,K) and
+  B=(K,N) in their natural (contiguous) layout.  Do NOT use `tl.trans(B)` on a
+  large tensor loaded from global memory -- the transpose becomes a gather and
+  kills bandwidth.
+- **Exception:** If B is stored in (N,K) layout (common for weights), load B
+  tiles as (BN, BK) and use `tl.dot(a, tl.trans(b))`.  The transpose happens
+  in registers on a small tile, which is fast.  This is actually preferred for
+  coalesced weight loads.
+- **Pre-compute layouts in `__init__`**, not in `forward()`.  For example,
+  `self._B_KN = self.weight.t().contiguous()` in init, not per-call.
+
+### Triton on RDNA4 (gfx1201)
+
+- **Wave size is 32** (not 64 like CDNA).  Use `num_warps=2` or `num_warps=4`.
+  `num_warps=8` wastes resources.
+- **num_stages=1** is often optimal.  RDNA4 has limited shared memory compared
+  to NVIDIA H100.  Try `num_stages=2` if compute-bound.
+- **BLOCK_M should match M** for skinny shapes.  If M=32, use `BLOCK_M=32` to
+  cover all rows in one tile and parallelize only along N.
+- **BLOCK_K=256** is a good starting point.  128 adds loop overhead, 512+
+  causes register pressure.
+- **fp8 `tl.dot` works natively** on Triton 3.5.1+ROCm.  Do NOT cast to bf16
+  before dot -- it wastes bandwidth and registers.
+
+### hipBLASLt vs Triton Decision
+
+| Scenario | Prefer |
+|----------|--------|
+| Large square matmul (M,N,K > 1024) | hipBLASLt (tuned) -- hard to beat |
+| Skinny matmul (M < 64) | Triton -- can specialize tile for exact M |
+| Fused epilogue (matmul + scale + activation) | Triton -- fuse into one kernel |
+| Standard dtype (fp32, bf16, fp16) | hipBLASLt (tuned) or Triton |
+| FP8 with custom scaling | Triton -- `_scaled_mm` has overhead |
+| Pure elementwise fusion | Triton -- always wins |
+
+### Profiling Workflow
+
+1. **Run `bench_kb.py` first** -- check both Stage 4 and Stage 5 speedup
+2. **If Stage 5 shows no gain** -- your kernel is genuinely slower, optimize it
+3. **If Stage 5 shows gain but Stage 4 doesn't** -- Python overhead; cache views,
+   pre-allocate outputs, minimize tensor ops in `forward()`
+4. **Use `--n-timed 1000`** for sub-millisecond kernels to reduce variance
+
+---
+
 ## Optimization Playbook by Problem Level
 
 ### Level 1: Single Operations (easy-medium)

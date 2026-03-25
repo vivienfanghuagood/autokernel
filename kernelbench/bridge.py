@@ -44,6 +44,7 @@ KERNEL_PY = PROJECT_DIR / "kernel.py"
 # Problem data structure
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class KernelBenchProblem:
     """A single KernelBench problem."""
@@ -75,7 +76,9 @@ class KernelBenchProblem:
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     @classmethod
-    def load_from_cache(cls, level: int, problem_id: int) -> Optional["KernelBenchProblem"]:
+    def load_from_cache(
+        cls, level: int, problem_id: int
+    ) -> Optional["KernelBenchProblem"]:
         cache_path = KB_CACHE_DIR / f"level{level}" / f"{problem_id}.py"
         meta_path = cache_path.with_suffix(".json")
         if not cache_path.exists():
@@ -161,9 +164,16 @@ class KernelBenchProblem:
 
         # Check for parameters
         param_indicators = [
-            "nn.Linear", "nn.Conv", "nn.BatchNorm", "nn.LayerNorm",
-            "nn.GroupNorm", "nn.InstanceNorm", "nn.Embedding",
-            "nn.Parameter", "self.weight", "self.bias",
+            "nn.Linear",
+            "nn.Conv",
+            "nn.BatchNorm",
+            "nn.LayerNorm",
+            "nn.GroupNorm",
+            "nn.InstanceNorm",
+            "nn.Embedding",
+            "nn.Parameter",
+            "self.weight",
+            "self.bias",
         ]
         for ind in param_indicators:
             if ind in self.source_code:
@@ -172,12 +182,16 @@ class KernelBenchProblem:
 
         # Count forward() body lines (proxy for complexity)
         fwd_match = re.search(
-            r'def\s+forward\s*\([^)]*\)\s*(?:->[^:]*)?:\s*\n((?:\s+.*\n)*)',
+            r"def\s+forward\s*\([^)]*\)\s*(?:->[^:]*)?:\s*\n((?:\s+.*\n)*)",
             self.source_code,
         )
         if fwd_match:
             body = fwd_match.group(1)
-            non_empty = [l for l in body.split("\n") if l.strip() and not l.strip().startswith("#")]
+            non_empty = [
+                l
+                for l in body.split("\n")
+                if l.strip() and not l.strip().startswith("#")
+            ]
             analysis["forward_lines"] = len(non_empty)
 
         # Estimate difficulty
@@ -245,7 +259,9 @@ import torch.nn.functional as F
             if line.strip() in skip_imports:
                 continue
             # Also skip `from torch.nn import functional as F` and similar
-            if re.match(r"^\s*import\s+torch\.nn\.functional\s+as\s+F\s*$", line.strip()):
+            if re.match(
+                r"^\s*import\s+torch\.nn\.functional\s+as\s+F\s*$", line.strip()
+            ):
                 continue
             filtered_lines.append(line)
         remaining_source = "\n".join(filtered_lines).strip()
@@ -334,7 +350,11 @@ import torch.nn.functional as F
                 continue
             if collecting:
                 # End of class: non-empty, non-indented, top-level construct
-                if line.strip() and not line[0].isspace() and not line.strip().startswith("#"):
+                if (
+                    line.strip()
+                    and not line[0].isspace()
+                    and not line.strip().startswith("#")
+                ):
                     if re.match(r"^(class |def |@)", line):
                         break
                 class_lines.append(line)
@@ -351,6 +371,7 @@ import torch.nn.functional as F
 # Problem loading from various sources
 # ---------------------------------------------------------------------------
 
+
 def load_from_huggingface(
     level: Optional[int] = None,
     problem_id: Optional[int] = None,
@@ -365,26 +386,23 @@ def load_from_huggingface(
 
     print("Loading KernelBench dataset from HuggingFace...")
     try:
-        ds = load_dataset("ScalingIntelligence/KernelBench", split="test")
-    except Exception:
-        # Try without split (some versions use different splits)
-        try:
-            ds = load_dataset("ScalingIntelligence/KernelBench")
-            # Try common split names
-            for split in ["test", "train", "validation"]:
-                if split in ds:
-                    ds = ds[split]
-                    break
-            else:
-                # Use first available split
-                ds = next(iter(ds.values()))
-        except Exception as e:
-            print(f"ERROR: Failed to load dataset: {e}")
-            print("       Check your network connection and HuggingFace access.")
-            sys.exit(1)
+        ds_dict = load_dataset("ScalingIntelligence/KernelBench")
+    except Exception as e:
+        print(f"ERROR: Failed to load dataset: {e}")
+        print("       Check your network connection and HuggingFace access.")
+        sys.exit(1)
+
+    # Dataset has splits named level_1, level_2, etc.
+    # If a specific level is requested, try that split first; otherwise iterate all.
+    if level is not None and f"level_{level}" in ds_dict:
+        all_entries = list(ds_dict[f"level_{level}"])
+    else:
+        all_entries = []
+        for split_name in sorted(ds_dict.keys()):
+            all_entries.extend(ds_dict[split_name])
 
     problems = []
-    for entry in ds:
+    for entry in all_entries:
         p_level = int(entry.get("level", entry.get("Level", 0)))
         p_id = int(entry.get("problem_id", entry.get("Problem_ID", 0)))
         p_name = str(entry.get("name", entry.get("Name", f"problem_{p_id}")))
@@ -398,7 +416,10 @@ def load_from_huggingface(
             continue
 
         prob = KernelBenchProblem(
-            level=p_level, problem_id=p_id, name=p_name, source_code=p_code,
+            level=p_level,
+            problem_id=p_id,
+            name=p_name,
+            source_code=p_code,
         )
         prob.save_to_cache()
         problems.append(prob)
@@ -434,7 +455,10 @@ def load_from_local_repo(
                 continue
             source = py_file.read_text(encoding="utf-8")
             prob = KernelBenchProblem(
-                level=lvl, problem_id=p_id, name=p_name, source_code=source,
+                level=lvl,
+                problem_id=p_id,
+                name=p_name,
+                source_code=source,
             )
             prob.save_to_cache()
             problems.append(prob)
@@ -456,7 +480,10 @@ def load_from_file(
     source = p.read_text(encoding="utf-8")
     name = p.stem.replace("_", " ")
     prob = KernelBenchProblem(
-        level=level, problem_id=problem_id, name=name, source_code=source,
+        level=level,
+        problem_id=problem_id,
+        name=name,
+        source_code=source,
     )
     prob.save_to_cache()
     return prob
@@ -465,6 +492,7 @@ def load_from_file(
 # ---------------------------------------------------------------------------
 # Cache queries
 # ---------------------------------------------------------------------------
+
 
 def list_cached(level: Optional[int] = None) -> List[Dict[str, Any]]:
     """List all cached problems with metadata."""
@@ -491,6 +519,7 @@ def get_problem(level: int, problem_id: int) -> Optional[KernelBenchProblem]:
 # ---------------------------------------------------------------------------
 # Workspace setup
 # ---------------------------------------------------------------------------
+
 
 def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
     """
@@ -551,6 +580,7 @@ def setup_problem(problem: KernelBenchProblem, backend: str = "cuda") -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="KernelBench Bridge -- Load and manage KernelBench problems",
@@ -580,7 +610,9 @@ def main() -> None:
     setup_p.add_argument("--problem", type=int, required=True)
     setup_p.add_argument("--backend", choices=["cuda", "triton"], default="cuda")
     setup_p.add_argument(
-        "--source", choices=["hf", "local", "file"], default=None,
+        "--source",
+        choices=["hf", "local", "file"],
+        default=None,
         help="Auto-fetch from this source if problem not in cache",
     )
     setup_p.add_argument("--repo-path", type=str, default=None)
@@ -595,12 +627,16 @@ def main() -> None:
             if not args.repo_path:
                 print("ERROR: --repo-path required for local source")
                 sys.exit(1)
-            load_from_local_repo(args.repo_path, level=args.level, problem_id=args.problem)
+            load_from_local_repo(
+                args.repo_path, level=args.level, problem_id=args.problem
+            )
         elif args.source == "file":
             if not args.file_path:
                 print("ERROR: --file-path required for file source")
                 sys.exit(1)
-            load_from_file(args.file_path, level=args.level or 1, problem_id=args.problem or 0)
+            load_from_file(
+                args.file_path, level=args.level or 1, problem_id=args.problem or 0
+            )
 
     elif args.command == "list":
         cached = list_cached(level=args.level)
@@ -618,8 +654,10 @@ def main() -> None:
         prob = get_problem(args.level, args.problem)
         if prob is None:
             print(f"Problem L{args.level}_P{args.problem:03d} not cached.")
-            print("  Fetch first: uv run kernelbench/bridge.py fetch --source hf "
-                  f"--level {args.level} --problem {args.problem}")
+            print(
+                "  Fetch first: uv run kernelbench/bridge.py fetch --source hf "
+                f"--level {args.level} --problem {args.problem}"
+            )
             sys.exit(1)
         analysis = prob.analyze()
         print(f"Problem {prob.uid}: {prob.name}")
@@ -647,17 +685,23 @@ def main() -> None:
                 prob = probs[0] if probs else None
             elif args.source == "local" and args.repo_path:
                 probs = load_from_local_repo(
-                    args.repo_path, level=args.level, problem_id=args.problem,
+                    args.repo_path,
+                    level=args.level,
+                    problem_id=args.problem,
                 )
                 prob = probs[0] if probs else None
             elif args.source == "file" and args.file_path:
                 prob = load_from_file(
-                    args.file_path, level=args.level, problem_id=args.problem,
+                    args.file_path,
+                    level=args.level,
+                    problem_id=args.problem,
                 )
         if prob is None:
             print(f"Problem L{args.level}_P{args.problem:03d} not found.")
-            print("  Fetch first: uv run kernelbench/bridge.py fetch --source hf "
-                  f"--level {args.level} --problem {args.problem}")
+            print(
+                "  Fetch first: uv run kernelbench/bridge.py fetch --source hf "
+                f"--level {args.level} --problem {args.problem}"
+            )
             print("  Or add --source hf to auto-fetch.")
             sys.exit(1)
         setup_problem(prob, backend=args.backend)

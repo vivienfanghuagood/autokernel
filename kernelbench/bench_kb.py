@@ -12,6 +12,8 @@ Additional AutoKernel features:
   - Determinism checks (3 runs with same seed must be bitwise identical)
   - VRAM monitoring
   - Timeout protection (30s per kernel call)
+  - hipBLASLt auto-tuning for fair BLAS baselines (ROCm)
+  - Pure GPU kernel latency profiling (per-call CUDA event, percentile stats)
   - Greppable summary output (for log parsing by the agent)
 
 Usage:
@@ -65,6 +67,7 @@ TIMEOUT_SECONDS = 30
 # Timeout helper
 # ---------------------------------------------------------------------------
 
+
 class _Timeout:
     """Context manager that raises TimeoutError after `seconds`."""
 
@@ -100,6 +103,7 @@ class _Timeout:
 # ---------------------------------------------------------------------------
 # Module loading
 # ---------------------------------------------------------------------------
+
 
 def _load_module_from_path(path: Path, module_name: str):
     """Dynamically load a Python module from a file path."""
@@ -160,8 +164,10 @@ def load_metadata() -> Dict[str, Any]:
 # Tensor comparison
 # ---------------------------------------------------------------------------
 
+
 def _has_nan_inf(t) -> bool:
     import torch
+
     return bool(torch.isnan(t).any() or torch.isinf(t).any())
 
 
@@ -228,29 +234,48 @@ def _compare_outputs(output, expected, atol: float, rtol: float) -> Dict[str, An
 
     if isinstance(output, (tuple, list)) and isinstance(expected, (tuple, list)):
         if len(output) != len(expected):
-            return {"match": False, "reason": f"output count mismatch: {len(output)} vs {len(expected)}"}
-        worst = {"match": True, "reason": "PASS", "max_abs_error": 0.0, "mean_abs_error": 0.0}
+            return {
+                "match": False,
+                "reason": f"output count mismatch: {len(output)} vs {len(expected)}",
+            }
+        worst = {
+            "match": True,
+            "reason": "PASS",
+            "max_abs_error": 0.0,
+            "mean_abs_error": 0.0,
+        }
         for i, (o, e) in enumerate(zip(output, expected)):
             r = _compare_outputs(o, e, atol, rtol)
             if not r["match"]:
                 return {"match": False, "reason": f"output[{i}]: {r['reason']}"}
-            worst["max_abs_error"] = max(worst["max_abs_error"], r.get("max_abs_error", 0))
+            worst["max_abs_error"] = max(
+                worst["max_abs_error"], r.get("max_abs_error", 0)
+            )
         return worst
 
     # Scalar comparison
     try:
         diff = abs(float(output) - float(expected))
         if diff <= atol:
-            return {"match": True, "reason": "PASS", "max_abs_error": diff, "mean_abs_error": diff}
+            return {
+                "match": True,
+                "reason": "PASS",
+                "max_abs_error": diff,
+                "mean_abs_error": diff,
+            }
     except (TypeError, ValueError):
         pass
 
-    return {"match": False, "reason": f"incomparable types: {type(output)} vs {type(expected)}"}
+    return {
+        "match": False,
+        "reason": f"incomparable types: {type(output)} vs {type(expected)}",
+    }
 
 
 # ---------------------------------------------------------------------------
 # Correctness evaluation
 # ---------------------------------------------------------------------------
+
 
 def run_correctness(
     model_new,
@@ -355,7 +380,9 @@ def run_stability(
                 for i, o in enumerate(output):
                     if isinstance(o, torch.Tensor) and _has_nan_inf(o):
                         result["stability"] = "WARN"
-                        result["details"].append(f"trial {trial}: output[{i}] contains NaN/Inf")
+                        result["details"].append(
+                            f"trial {trial}: output[{i}] contains NaN/Inf"
+                        )
 
         except Exception as e:
             result["stability"] = "FAIL"
@@ -378,8 +405,7 @@ def run_determinism(
         torch.manual_seed(42)
         inputs = get_inputs_fn()
         inputs_dev = [
-            inp.to(device) if isinstance(inp, torch.Tensor) else inp
-            for inp in inputs
+            inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in inputs
         ]
         inputs_copies = [
             [
@@ -396,7 +422,9 @@ def run_determinism(
             if isinstance(out, torch.Tensor):
                 outputs.append(out.clone())
             elif isinstance(out, (tuple, list)):
-                outputs.append(tuple(o.clone() if isinstance(o, torch.Tensor) else o for o in out))
+                outputs.append(
+                    tuple(o.clone() if isinstance(o, torch.Tensor) else o for o in out)
+                )
             else:
                 outputs.append(out)
 
@@ -424,6 +452,7 @@ def run_determinism(
 # Performance evaluation
 # ---------------------------------------------------------------------------
 
+
 def run_performance(
     model_new,
     model_ref,
@@ -449,8 +478,7 @@ def run_performance(
     torch.manual_seed(0)
     inputs = get_inputs_fn()
     inputs_dev = [
-        inp.to(device) if isinstance(inp, torch.Tensor) else inp
-        for inp in inputs
+        inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in inputs
     ]
 
     def _time_model(model, inputs_list, n_warm, n_iter):
@@ -497,7 +525,7 @@ def _robust_median(times: List[float]) -> float:
     s = sorted(times)
     n = len(s)
     trim = max(1, n // 10)
-    trimmed = s[trim:n - trim] if n > 2 * trim else s
+    trimmed = s[trim : n - trim] if n > 2 * trim else s
     mid = len(trimmed) // 2
     if len(trimmed) % 2 == 0:
         return (trimmed[mid - 1] + trimmed[mid]) / 2
@@ -505,12 +533,188 @@ def _robust_median(times: List[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# hipBLASLt auto-tuning (ROCm)
+# ---------------------------------------------------------------------------
+
+
+TUNING_N_WARMUP = 200
+TUNING_FILE_NAME = "hipblaslt_tuning.csv"
+
+
+def _try_enable_hipblaslt_tuning(
+    model_ref,
+    get_inputs_fn: Callable,
+    device: str = "cuda",
+) -> bool:
+    """Auto-tune hipBLASLt for the reference model to establish a fair baseline.
+
+    On ROCm, ``torch._scaled_mm`` and ``torch.mm`` use hipBLASLt whose
+    default heuristic picks a mediocre algorithm.  Running the tunable-ops
+    warmup phase selects the fastest algorithm for the actual problem shape,
+    which can be 1.5-2x faster.  Without this, any custom Triton kernel
+    appears to "win" by comparing against an unfairly slow baseline.
+
+    The tuning result is persisted to ``hipblaslt_tuning.csv`` so subsequent
+    runs skip the search.
+    """
+    try:
+        import torch
+        import torch.cuda.tunable as tunable
+    except (ImportError, AttributeError):
+        return False
+
+    tuning_path = PROJECT_DIR / TUNING_FILE_NAME
+    already_tuned = tuning_path.exists()
+
+    # Always enable + load if file exists
+    if already_tuned:
+        tunable.enable(True)
+        tunable.set_filename(str(tuning_path))
+        tunable.read_file(str(tuning_path))
+        print(f"  Loaded hipBLASLt tuning from {tuning_path.name}")
+        return True
+
+    # Otherwise, run tuning warmup
+    print("  Running hipBLASLt auto-tuning (one-time)...")
+    tunable.enable(True)
+    tunable.tuning_enable(True)
+    tunable.set_max_tuning_iterations(100)
+    tunable.set_max_tuning_duration(30)
+    tunable.set_filename(str(tuning_path))
+
+    try:
+        inputs = get_inputs_fn()
+        inputs_dev = [
+            inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in inputs
+        ]
+        for _ in range(TUNING_N_WARMUP):
+            with torch.no_grad():
+                model_ref(*inputs_dev)
+            torch.cuda.synchronize()
+        tunable.write_file(str(tuning_path))
+        print(f"  hipBLASLt tuning saved to {tuning_path.name}")
+        return True
+    except Exception as e:
+        print(f"  hipBLASLt tuning failed (non-fatal): {e}")
+        tunable.enable(False)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Pure GPU kernel latency profiling
+# ---------------------------------------------------------------------------
+
+
+def run_pure_latency(
+    model,
+    get_inputs_fn: Callable,
+    n_warmup: int = 50,
+    n_iter: int = 2000,
+    device: str = "cuda",
+    label: str = "model",
+) -> Dict[str, Any]:
+    """Measure pure GPU kernel latency with per-call CUDA event timing.
+
+    Unlike ``run_performance`` which includes Python dispatch overhead in
+    the loop, this function pre-creates all inputs and events, then runs
+    the tightest possible timing loop:
+
+        start.record()
+        model(*inputs)
+        end.record()
+        sync()
+
+    Returns min/p50/p90/p99/mean/std in **microseconds**.
+    """
+    import torch
+
+    result: Dict[str, Any] = {
+        "label": label,
+        "min_us": 0.0,
+        "p50_us": 0.0,
+        "p90_us": 0.0,
+        "p99_us": 0.0,
+        "mean_us": 0.0,
+        "std_us": 0.0,
+        "n_iter": n_iter,
+    }
+
+    try:
+        # Pre-create inputs on device once
+        inputs = get_inputs_fn()
+        inputs_dev = [
+            inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in inputs
+        ]
+
+        # Warmup (JIT compilation, cache fill)
+        for _ in range(n_warmup):
+            with torch.no_grad():
+                model(*inputs_dev)
+        torch.cuda.synchronize()
+
+        # Timed: per-call CUDA event timing
+        times_us: List[float] = []
+        for _ in range(n_iter):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            with torch.no_grad():
+                model(*inputs_dev)
+            end.record()
+            torch.cuda.synchronize()
+            times_us.append(start.elapsed_time(end) * 1000.0)  # ms -> us
+
+        times_us.sort()
+        n = len(times_us)
+        result["min_us"] = times_us[0]
+        result["p50_us"] = times_us[n // 2]
+        result["p90_us"] = times_us[int(n * 0.90)]
+        result["p99_us"] = times_us[int(n * 0.99)]
+        result["mean_us"] = sum(times_us) / n
+        result["std_us"] = statistics.stdev(times_us) if n > 1 else 0.0
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+def _print_latency_table(
+    ref_lat: Dict[str, Any],
+    kern_lat: Dict[str, Any],
+) -> None:
+    """Print a side-by-side pure GPU latency comparison table."""
+    print()
+    print("-" * 65)
+    print("Pure GPU Kernel Latency (per-call CUDA event, 2000 samples)")
+    print("-" * 65)
+    header = f"{'':18s} {'min':>8s} {'p50':>8s} {'p90':>8s} {'p99':>8s} {'mean':>8s} {'std':>8s}"
+    print(header)
+    for lat in [ref_lat, kern_lat]:
+        if "error" in lat:
+            print(f"  {lat['label']:16s}  ERROR: {lat['error']}")
+            continue
+        print(
+            f"  {lat['label']:16s}"
+            f" {lat['min_us']:7.1f}  {lat['p50_us']:7.1f}"
+            f"  {lat['p90_us']:7.1f}  {lat['p99_us']:7.1f}"
+            f"  {lat['mean_us']:7.1f}  {lat['std_us']:7.1f}  us"
+        )
+    # Speedup at p50
+    if ref_lat.get("p50_us", 0) > 0 and kern_lat.get("p50_us", 0) > 0:
+        sp = ref_lat["p50_us"] / kern_lat["p50_us"]
+        print(f"  {'p50 speedup':16s}  {sp:.3f}x")
+    print("-" * 65)
+
+
+# ---------------------------------------------------------------------------
 # VRAM monitoring
 # ---------------------------------------------------------------------------
+
 
 def get_vram_usage() -> Dict[str, float]:
     """Get current GPU VRAM usage in MB."""
     import torch
+
     if not torch.cuda.is_available():
         return {"allocated_mb": 0, "reserved_mb": 0, "peak_mb": 0}
     return {
@@ -524,34 +728,60 @@ def get_vram_usage() -> Dict[str, float]:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="KernelBench Evaluation -- Correctness + Performance",
     )
-    parser.add_argument("--quick", action="store_true",
-                        help="Quick mode: 3 trials, 30 timed runs")
-    parser.add_argument("--correctness-only", action="store_true",
-                        help="Skip performance benchmarking")
-    parser.add_argument("--n-trials", type=int, default=None,
-                        help=f"Correctness trials (default: {DEFAULT_N_CORRECTNESS})")
-    parser.add_argument("--n-timed", type=int, default=None,
-                        help=f"Timed iterations (default: {DEFAULT_N_TIMED})")
-    parser.add_argument("--n-warmup", type=int, default=DEFAULT_N_WARMUP,
-                        help=f"Warmup iterations (default: {DEFAULT_N_WARMUP})")
-    parser.add_argument("--atol", type=float, default=DEFAULT_ATOL,
-                        help=f"Absolute tolerance (default: {DEFAULT_ATOL})")
-    parser.add_argument("--rtol", type=float, default=DEFAULT_RTOL,
-                        help=f"Relative tolerance (default: {DEFAULT_RTOL})")
-    parser.add_argument("--skip-stability", action="store_true",
-                        help="Skip stability test")
-    parser.add_argument("--skip-determinism", action="store_true",
-                        help="Skip determinism test")
+    parser.add_argument(
+        "--quick", action="store_true", help="Quick mode: 3 trials, 30 timed runs"
+    )
+    parser.add_argument(
+        "--correctness-only", action="store_true", help="Skip performance benchmarking"
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=None,
+        help=f"Correctness trials (default: {DEFAULT_N_CORRECTNESS})",
+    )
+    parser.add_argument(
+        "--n-timed",
+        type=int,
+        default=None,
+        help=f"Timed iterations (default: {DEFAULT_N_TIMED})",
+    )
+    parser.add_argument(
+        "--n-warmup",
+        type=int,
+        default=DEFAULT_N_WARMUP,
+        help=f"Warmup iterations (default: {DEFAULT_N_WARMUP})",
+    )
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=DEFAULT_ATOL,
+        help=f"Absolute tolerance (default: {DEFAULT_ATOL})",
+    )
+    parser.add_argument(
+        "--rtol",
+        type=float,
+        default=DEFAULT_RTOL,
+        help=f"Relative tolerance (default: {DEFAULT_RTOL})",
+    )
+    parser.add_argument(
+        "--skip-stability", action="store_true", help="Skip stability test"
+    )
+    parser.add_argument(
+        "--skip-determinism", action="store_true", help="Skip determinism test"
+    )
 
     args = parser.parse_args()
     n_trials = args.n_trials or (3 if args.quick else DEFAULT_N_CORRECTNESS)
     n_timed = args.n_timed or (30 if args.quick else DEFAULT_N_TIMED)
 
     import torch
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
         print("WARNING: No CUDA GPU detected. Results on CPU are not meaningful.")
@@ -597,6 +827,21 @@ def main() -> None:
         _print_summary("FAIL", 0.0, uid, name, {"correctness": "FAIL"})
         sys.exit(1)
 
+    # Sync weights: copy reference model parameters into ModelNew
+    # This is standard KernelBench protocol -- ModelNew must be evaluated
+    # with the same weights as Model to ensure correctness comparison is fair.
+    import torch
+
+    ref_sd = model_ref.state_dict()
+    new_sd = model_new.state_dict()
+    if ref_sd and new_sd:
+        try:
+            # Try strict load first (same parameter names)
+            model_new.load_state_dict(ref_sd, strict=False)
+            print("  Synced weights from reference model to ModelNew")
+        except Exception as e:
+            print(f"  WARNING: Could not sync weights: {e}")
+
     if hasattr(model_new, "to"):
         model_new = model_new.to(device)
     if hasattr(model_new, "eval"):
@@ -607,14 +852,27 @@ def main() -> None:
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
+    # ---- hipBLASLt auto-tuning (ROCm) ----
+    if device == "cuda":
+        _try_enable_hipblaslt_tuning(model_ref, get_inputs_fn, device=device)
+
     # ---- Stage 1: Correctness ----
-    print(f"\n--- Stage 1: Correctness ({n_trials} trials, atol={args.atol}, rtol={args.rtol}) ---")
+    print(
+        f"\n--- Stage 1: Correctness ({n_trials} trials, atol={args.atol}, rtol={args.rtol}) ---"
+    )
     correctness = run_correctness(
-        model_new, model_ref, get_inputs_fn,
-        n_trials=n_trials, atol=args.atol, rtol=args.rtol, device=device,
+        model_new,
+        model_ref,
+        get_inputs_fn,
+        n_trials=n_trials,
+        atol=args.atol,
+        rtol=args.rtol,
+        device=device,
     )
     status = correctness["correctness"]
-    print(f"  Trials passed: {correctness['trials_passed']}/{correctness['trials_total']}")
+    print(
+        f"  Trials passed: {correctness['trials_passed']}/{correctness['trials_total']}"
+    )
     if status == "PASS":
         print(f"  Worst max_abs_error: {correctness['worst_max_abs_error']:.6e}")
         print(f"  Worst mean_abs_error: {correctness['worst_mean_abs_error']:.6e}")
@@ -645,10 +903,16 @@ def main() -> None:
     # ---- Stage 4: Performance ----
     perf: Dict[str, Any] = {"speedup": 0.0}
     if not args.correctness_only and status == "PASS":
-        print(f"\n--- Stage 4: Performance ({args.n_warmup} warmup + {n_timed} timed) ---")
+        print(
+            f"\n--- Stage 4: Performance ({args.n_warmup} warmup + {n_timed} timed) ---"
+        )
         perf = run_performance(
-            model_new, model_ref, get_inputs_fn,
-            n_warmup=args.n_warmup, n_timed=n_timed, device=device,
+            model_new,
+            model_ref,
+            get_inputs_fn,
+            n_warmup=args.n_warmup,
+            n_timed=n_timed,
+            device=device,
         )
         print(f"  Reference time: {perf['reference_time_ms']:.4f} ms")
         print(f"  Kernel time:    {perf['kernel_time_ms']:.4f} ms")
@@ -657,24 +921,63 @@ def main() -> None:
             print(f"  Error:          {perf['error']}")
         if perf.get("kernel_times"):
             kt = perf["kernel_times"]
-            print(f"  Kernel stats:   median={statistics.median(kt):.4f}ms, "
-                  f"std={statistics.stdev(kt) if len(kt) > 1 else 0:.4f}ms, "
-                  f"min={min(kt):.4f}ms, max={max(kt):.4f}ms")
+            print(
+                f"  Kernel stats:   median={statistics.median(kt):.4f}ms, "
+                f"std={statistics.stdev(kt) if len(kt) > 1 else 0:.4f}ms, "
+                f"min={min(kt):.4f}ms, max={max(kt):.4f}ms"
+            )
     elif status != "PASS":
         print("\n--- Stage 4: Performance SKIPPED (correctness failed) ---")
+
+    # ---- Stage 5: Pure GPU Kernel Latency ----
+    ref_lat: Dict[str, Any] = {}
+    kern_lat: Dict[str, Any] = {}
+    if not args.correctness_only and status == "PASS" and device == "cuda":
+        print(f"\n--- Stage 5: Pure GPU Kernel Latency (2000 per-call samples) ---")
+        ref_lat = run_pure_latency(
+            model_ref,
+            get_inputs_fn,
+            n_warmup=50,
+            n_iter=2000,
+            device=device,
+            label="reference",
+        )
+        kern_lat = run_pure_latency(
+            model_new,
+            get_inputs_fn,
+            n_warmup=50,
+            n_iter=2000,
+            device=device,
+            label="kernel",
+        )
+        _print_latency_table(ref_lat, kern_lat)
 
     vram = get_vram_usage() if device == "cuda" else {}
 
     _print_summary(
-        status, perf.get("speedup", 0.0), uid, name,
-        {**correctness, **stability, **determinism, **perf, **vram},
+        status,
+        perf.get("speedup", 0.0),
+        uid,
+        name,
+        {
+            **correctness,
+            **stability,
+            **determinism,
+            **perf,
+            **vram,
+            **{f"ref_{k}": v for k, v in ref_lat.items() if k != "label"},
+            **{f"kern_{k}": v for k, v in kern_lat.items() if k != "label"},
+        },
     )
     _save_results(uid, correctness, stability, determinism, perf, vram, meta)
 
 
 def _print_summary(
-    correctness_status: str, speedup: float,
-    uid: str, name: str, data: Dict[str, Any],
+    correctness_status: str,
+    speedup: float,
+    uid: str,
+    name: str,
+    data: Dict[str, Any],
 ) -> None:
     """Print greppable summary for agent log parsing."""
     print()
@@ -691,6 +994,13 @@ def _print_summary(
     print(f"determinism: {data.get('determinism', 'SKIP')}")
     print(f"peak_vram_mb: {data.get('peak_mb', 0):.1f}")
     print(f"worst_max_abs_error: {data.get('worst_max_abs_error', 0):.6e}")
+    # Pure GPU latency (if available)
+    ref_p50 = data.get("ref_p50_us", 0)
+    kern_p50 = data.get("kern_p50_us", 0)
+    if ref_p50 > 0 and kern_p50 > 0:
+        print(f"gpu_latency_ref_p50_us: {ref_p50:.1f}")
+        print(f"gpu_latency_kern_p50_us: {kern_p50:.1f}")
+        print(f"gpu_latency_speedup: {ref_p50 / kern_p50:.3f}x")
     for threshold in [1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 5.0]:
         passes = correctness_status == "PASS" and speedup >= threshold
         print(f"fast_{threshold}: {'PASS' if passes else 'FAIL'}")

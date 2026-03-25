@@ -8,8 +8,7 @@ dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=2.2.0",
     "pandas>=2.2.0",
-    "torch>=2.4.0",
-    "triton>=3.3.0",
+    "openai>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -36,13 +35,3 @@ hf-kernels = [
     "kernels>=0.4.0",
     "huggingface-hub>=0.20.0",
 ]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
