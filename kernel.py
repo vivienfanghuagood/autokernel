@@ -122,9 +122,10 @@ def flash_attention_kernel(
         m_new = tl.maximum(m_i, m_ij)
 
         # Correction factor for previous accumulator
-        alpha = tl.exp(m_i - m_new)
+        # Clamp to avoid exp overflow with adversarial inputs
+        alpha = tl.exp(tl.maximum(m_i - m_new, -30.0))
         # New attention weights
-        p = tl.exp(qk - m_new[:, None])
+        p = tl.exp(tl.maximum(qk - m_new[:, None], -30.0))
 
         # Update running sum
         l_i = l_i * alpha + tl.sum(p, axis=1)
