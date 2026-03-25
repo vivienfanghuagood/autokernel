@@ -322,7 +322,10 @@ import torch.nn.functional as F
         """Extract Model class source and produce a renamed ModelNew copy."""
         model_src = self._extract_class("Model")
         if model_src:
-            return model_src.replace("class Model(", "class ModelNew(", 1)
+            renamed = model_src.replace("class Model(", "class ModelNew(", 1)
+            # Fix super() calls: super(Model, self) -> super(ModelNew, self)
+            renamed = renamed.replace("super(Model,", "super(ModelNew,")
+            return renamed
 
         # Fallback: delegate wrapper
         return '''class ModelNew(nn.Module):
